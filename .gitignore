@@ -3,6 +3,3 @@ ipv6-ddns-cloudflare
 
 # Config with secrets
 config.yaml
-
-# Go
-go.sum
