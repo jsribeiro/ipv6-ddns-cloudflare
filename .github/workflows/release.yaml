@@ -24,8 +24,19 @@ jobs:
         run: |
           GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ipv6-ddns-cloudflare .
 
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          cp ipv6-ddns-cloudflare release/
+          cp install.sh release/
+          cp ipv6-ddns-cloudflare.service release/
+          cp config.example.yaml release/
+          cp README.md release/
+          cp LICENSE release/
+          tar -czvf ipv6-ddns-cloudflare-linux-amd64.tar.gz -C release .
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ipv6-ddns-cloudflare
+          files: ipv6-ddns-cloudflare-linux-amd64.tar.gz
           generate_release_notes: true
