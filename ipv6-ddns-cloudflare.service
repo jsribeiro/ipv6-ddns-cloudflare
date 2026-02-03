@@ -1,0 +1,31 @@
+[Unit]
+Description=IPv6 Dynamic DNS updater for CloudFlare
+Documentation=https://github.com/cloudflare/cloudflare-go
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ipv6-ddns-cloudflare -config /etc/ipv6-ddns-cloudflare/config.yaml
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=true
+
+# Allow reading network interface info
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

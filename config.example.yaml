@@ -1,0 +1,30 @@
+# IPv6 DDNS CloudFlare Configuration
+
+# Network interface to monitor for IPv6 address changes
+interface: eth0
+
+# Polling interval in seconds
+poll_interval: 30
+
+# Stability delay - wait this many seconds after detecting a change
+# before updating DNS (ensures address is stable)
+stability_delay: 5
+
+# CloudFlare API configuration
+cloudflare:
+  # API Token with DNS edit permissions for the zone
+  # Create at: https://dash.cloudflare.com/profile/api-tokens
+  # Required permissions: Zone.DNS (Edit)
+  api_token: "your-cloudflare-api-token-here"
+  
+  # Zone ID (found in CloudFlare dashboard: domain Overview page, API section at bottom)
+  zone_id: "your-zone-id-here"
+  
+  # DNS record name to update (e.g., "home.example.com")
+  record_name: "home.example.com"
+  
+  # TTL for the DNS record (1 = automatic, or specify seconds like 300)
+  ttl: 1
+  
+  # Whether the record should be proxied through CloudFlare
+  proxied: false
