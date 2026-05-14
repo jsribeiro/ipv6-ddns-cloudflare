@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -69,6 +70,10 @@ type CFError struct {
 	Message string `json:"message"`
 }
 
+func isValidPublicIPv6(ip net.IP) bool {
+	return ip.To4() == nil && ip.IsGlobalUnicast() && !ip.IsPrivate()
+}
+
 type DDNSService struct {
 	config         Config
 	httpClient     *http.Client
@@ -76,6 +81,9 @@ type DDNSService struct {
 	pendingIP      string
 	stabilityTimer *time.Timer
 	recordID       string
+	getIPv6        func(string) (string, error)
+	apiBaseURL     string
+	mu             sync.Mutex
 }
 
 func main() {
@@ -96,6 +104,8 @@ func main() {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		getIPv6:    getPublicIPv6,
+		apiBaseURL: "https://api.cloudflare.com/client/v4",
 	}
 
 	// Get the current DNS record ID
@@ -172,15 +182,15 @@ func validateConfig(config Config) error {
 	return nil
 }
 
-func (s *DDNSService) getPublicIPv6() (string, error) {
-	iface, err := net.InterfaceByName(s.config.Interface)
+func getPublicIPv6(ifaceName string) (string, error) {
+	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		return "", fmt.Errorf("interface %s not found: %w", s.config.Interface, err)
+		return "", fmt.Errorf("interface %s not found: %w", ifaceName, err)
 	}
 
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return "", fmt.Errorf("getting addresses for %s: %w", s.config.Interface, err)
+		return "", fmt.Errorf("getting addresses for %s: %w", ifaceName, err)
 	}
 
 	for _, addr := range addrs {
@@ -191,49 +201,30 @@ func (s *DDNSService) getPublicIPv6() (string, error) {
 
 		ip := ipNet.IP
 
-		// Must be IPv6
-		if ip.To4() != nil {
-			continue
-		}
-
-		// Skip link-local (fe80::/10)
-		if ip.IsLinkLocalUnicast() {
-			continue
-		}
-
-		// Skip loopback
-		if ip.IsLoopback() {
-			continue
-		}
-
-		// Skip ULA (fc00::/7)
-		if ip[0] == 0xfc || ip[0] == 0xfd {
-			continue
-		}
-
-		// This should be a global unicast address
-		if ip.IsGlobalUnicast() {
+		if isValidPublicIPv6(ip) {
 			return ip.String(), nil
 		}
 	}
 
-	return "", fmt.Errorf("no public IPv6 address found on interface %s", s.config.Interface)
+	return "", fmt.Errorf("no public IPv6 address found on interface %s", ifaceName)
 }
 
 func (s *DDNSService) checkAndUpdate() {
-	currentIP, err := s.getPublicIPv6()
+	currentIP, err := s.getIPv6(s.config.Interface)
 	if err != nil {
 		log.Printf("Error getting IPv6 address: %v", err)
 		return
 	}
 
+	s.mu.Lock()
 	// No change from last known stable IP
 	if currentIP == s.lastKnownIP {
 		// If we had a pending change that reverted, cancel it
 		if s.pendingIP != "" && s.pendingIP != currentIP {
 			log.Printf("Address reverted to %s, cancelling pending update", currentIP)
-			s.cancelPendingUpdate()
+			s.cancelPendingUpdateLocked()
 		}
+		s.mu.Unlock()
 		return
 	}
 
@@ -245,11 +236,18 @@ func (s *DDNSService) checkAndUpdate() {
 			log.Printf("Detected new IPv6 address: %s (was: %s)", currentIP, s.lastKnownIP)
 		}
 		s.pendingIP = currentIP
-		s.startStabilityTimer()
+		s.startStabilityTimerLocked()
 	}
+	s.mu.Unlock()
 }
 
 func (s *DDNSService) startStabilityTimer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startStabilityTimerLocked()
+}
+
+func (s *DDNSService) startStabilityTimerLocked() {
 	// Cancel any existing timer
 	if s.stabilityTimer != nil {
 		s.stabilityTimer.Stop()
@@ -258,34 +256,48 @@ func (s *DDNSService) startStabilityTimer() {
 	log.Printf("Waiting %d seconds for address stability...", s.config.StabilityDelay)
 
 	s.stabilityTimer = time.AfterFunc(time.Duration(s.config.StabilityDelay)*time.Second, func() {
+		s.mu.Lock()
+
 		// Verify the address is still the same
-		currentIP, err := s.getPublicIPv6()
+		currentIP, err := s.getIPv6(s.config.Interface)
 		if err != nil {
 			log.Printf("Error verifying IPv6 address: %v", err)
 			s.pendingIP = ""
+			s.mu.Unlock()
 			return
 		}
 
 		if currentIP != s.pendingIP {
 			log.Printf("Address changed during stability window, restarting timer")
 			s.pendingIP = currentIP
-			s.startStabilityTimer()
+			s.startStabilityTimerLocked()
+			s.mu.Unlock()
 			return
 		}
 
 		// Address is stable, update DNS
 		log.Printf("Address stable for %d seconds, updating DNS", s.config.StabilityDelay)
-		if err := s.updateDNS(currentIP); err != nil {
+		s.mu.Unlock()
+		err = s.updateDNS(currentIP)
+		s.mu.Lock()
+		if err != nil {
 			log.Printf("Failed to update DNS: %v", err)
 		} else {
 			log.Printf("Successfully updated DNS record to %s", currentIP)
 			s.lastKnownIP = currentIP
 		}
 		s.pendingIP = ""
+		s.mu.Unlock()
 	})
 }
 
 func (s *DDNSService) cancelPendingUpdate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancelPendingUpdateLocked()
+}
+
+func (s *DDNSService) cancelPendingUpdateLocked() {
 	if s.stabilityTimer != nil {
 		s.stabilityTimer.Stop()
 		s.stabilityTimer = nil
@@ -294,15 +306,16 @@ func (s *DDNSService) cancelPendingUpdate() {
 }
 
 func (s *DDNSService) fetchRecordID() error {
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=AAAA&name=%s",
-		s.config.CloudFlare.ZoneID, s.config.CloudFlare.RecordName)
+	cfConfig := s.config.CloudFlare
+	url := fmt.Sprintf("%s/zones/%s/dns_records?type=AAAA&name=%s",
+		s.apiBaseURL, cfConfig.ZoneID, cfConfig.RecordName)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+s.config.CloudFlare.APIToken)
+	req.Header.Set("Authorization", "Bearer "+cfConfig.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.httpClient.Do(req)
@@ -332,24 +345,32 @@ func (s *DDNSService) fetchRecordID() error {
 
 	if len(cfResp.Result) == 0 {
 		// Record doesn't exist, we'll create it on first update
-		log.Printf("DNS record %s does not exist, will create on first update", s.config.CloudFlare.RecordName)
+		log.Printf("DNS record %s does not exist, will create on first update", cfConfig.RecordName)
 		return nil
 	}
 
+	s.mu.Lock()
 	s.recordID = cfResp.Result[0].ID
 	s.lastKnownIP = cfResp.Result[0].Content
-	log.Printf("Found existing record %s with IP %s", s.config.CloudFlare.RecordName, s.lastKnownIP)
+	s.mu.Unlock()
+
+	log.Printf("Found existing record %s with IP %s", cfConfig.RecordName, cfResp.Result[0].Content)
 
 	return nil
 }
 
 func (s *DDNSService) updateDNS(ip string) error {
+	s.mu.Lock()
+	recordID := s.recordID
+	cfConfig := s.config.CloudFlare
+	s.mu.Unlock()
+
 	record := map[string]interface{}{
 		"type":    "AAAA",
-		"name":    s.config.CloudFlare.RecordName,
+		"name":    cfConfig.RecordName,
 		"content": ip,
-		"ttl":     s.config.CloudFlare.TTL,
-		"proxied": s.config.CloudFlare.Proxied,
+		"ttl":     cfConfig.TTL,
+		"proxied": cfConfig.Proxied,
 	}
 
 	body, err := json.Marshal(record)
@@ -360,15 +381,15 @@ func (s *DDNSService) updateDNS(ip string) error {
 	var url string
 	var method string
 
-	if s.recordID == "" {
+	if recordID == "" {
 		// Create new record
-		url = fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records",
-			s.config.CloudFlare.ZoneID)
+		url = fmt.Sprintf("%s/zones/%s/dns_records",
+			s.apiBaseURL, cfConfig.ZoneID)
 		method = "POST"
 	} else {
 		// Update existing record
-		url = fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s",
-			s.config.CloudFlare.ZoneID, s.recordID)
+		url = fmt.Sprintf("%s/zones/%s/dns_records/%s",
+			s.apiBaseURL, cfConfig.ZoneID, recordID)
 		method = "PUT"
 	}
 
@@ -377,7 +398,7 @@ func (s *DDNSService) updateDNS(ip string) error {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+s.config.CloudFlare.APIToken)
+	req.Header.Set("Authorization", "Bearer "+cfConfig.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.httpClient.Do(req)
@@ -410,9 +431,11 @@ func (s *DDNSService) updateDNS(ip string) error {
 	}
 
 	// Store the record ID if this was a create
+	s.mu.Lock()
 	if s.recordID == "" {
 		s.recordID = cfResp.Result.ID
 	}
+	s.mu.Unlock()
 
 	return nil
 }
